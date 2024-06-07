@@ -28,7 +28,6 @@ import software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse;
 import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamOutput;
 import software.amazon.awssdk.services.bedrockruntime.model.Message;
 import software.amazon.awssdk.services.bedrockruntime.model.MessageStopEvent;
-import software.amazon.awssdk.services.bedrockruntime.model.StopReason;
 
 /**
  * Amazon Bedrock Chat model converse interface generation metadata, encapsulating
@@ -83,6 +82,10 @@ public class BedrockConverseChatGenerationMetadata implements ChatGenerationMeta
 		return stopReason;
 	}
 
+	public void setFinishReason(String stopReason) {
+		this.stopReason = stopReason;
+	}
+
 	public Message getMessage() {
 		return message;
 	}
@@ -108,26 +111,22 @@ public class BedrockConverseChatGenerationMetadata implements ChatGenerationMeta
 			}
 		}
 
-		if (event instanceof MessageStopEvent stopEvent) {
-			return stopEvent.stopReason() != StopReason.TOOL_USE;
-		}
-
 		return true;
 	}
 
-	public static void generateEventMessage(ChatGenerationMetadata chatGenerationMetadata) {
-		if (chatGenerationMetadata instanceof BedrockConverseChatGenerationMetadata metadata) {
-			ConverseStreamOutput event = metadata.getEvent();
+	public void generateEventMessage() {
+		if (this.event == null) {
+			return;
+		}
 
-			if (event instanceof ContentBlockDeltaEvent deltaEvent) {
-				Message message = BedrockConverseApiUtils.createMessage(
-						List.of(ContentBlock.builder().text(deltaEvent.delta().text()).build()),
-						ConversationRole.ASSISTANT);
-				metadata.setMessage(message);
-			}
-			else {
-				metadata.setMessage(BedrockConverseApiUtils.EMPTY_MESSAGE);
-			}
+		if (event instanceof ContentBlockDeltaEvent deltaEvent) {
+			Message message = BedrockConverseApiUtils.createMessage(
+					List.of(ContentBlock.builder().text(deltaEvent.delta().text()).build()),
+					ConversationRole.ASSISTANT);
+			setMessage(message);
+		}
+		else {
+			setMessage(BedrockConverseApiUtils.EMPTY_MESSAGE);
 		}
 	}
 

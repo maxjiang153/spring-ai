@@ -26,14 +26,22 @@ import software.amazon.awssdk.services.bedrockruntime.model.ToolResultContentBlo
 import software.amazon.awssdk.services.bedrockruntime.model.ToolResultStatus;
 import software.amazon.awssdk.services.bedrockruntime.model.ToolSpecification;
 import software.amazon.awssdk.services.bedrockruntime.model.ToolUseBlock;
+import software.amazon.awssdk.services.bedrockruntime.model.ToolUseBlockStart;
+import software.amazon.awssdk.core.document.Document;
 import software.amazon.awssdk.services.bedrockruntime.model.ContentBlock;
 import software.amazon.awssdk.services.bedrockruntime.model.ContentBlock.Type;
+import software.amazon.awssdk.services.bedrockruntime.model.ContentBlockDeltaEvent;
+import software.amazon.awssdk.services.bedrockruntime.model.ContentBlockStartEvent;
 import software.amazon.awssdk.services.bedrockruntime.model.ConversationRole;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamOutput;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.springframework.ai.bedrock.BedrockConverseChatGenerationMetadata;
 import org.springframework.ai.bedrock.api.BedrockConverseApi;
@@ -109,10 +117,10 @@ public class BedrockAnthropic3ChatModel
 	@Override
 	public Flux<ChatResponse> stream(Prompt prompt) {
 		Assert.notNull(prompt, "Prompt must not be null.");
-
+		
 		var request = createBedrockConverseRequest(prompt);
 
-		return this.callWithFunctionSupportStream(request);
+		return converseApi.converseStream(request);
 	}
 
 	private BedrockConverseRequest createBedrockConverseRequest(Prompt prompt) {
@@ -243,6 +251,7 @@ public class BedrockAnthropic3ChatModel
 
 	@Override
 	protected Flux<ChatResponse> doChatCompletionStream(BedrockConverseRequest request) {
+		// TODO
 		return converseApi.converseStream(request)
 			.bufferUntil(this::shouldBeBuffered)
 			.buffer()
@@ -265,13 +274,73 @@ public class BedrockAnthropic3ChatModel
 		if (responses.size() == 1) {
 			ChatResponse chatResponse = responses.get(0);
 
-			BedrockConverseChatGenerationMetadata.generateEventMessage(chatResponse.getResult().getMetadata());
+			Generation generation = chatResponse.getResult();
+
+			if (generation != null) {
+				var metadata = (BedrockConverseChatGenerationMetadata) generation.getMetadata();
+
+				metadata.generateEventMessage();
+			}
 
 			return chatResponse;
 		}
 		else {
-			// TODO tool
-			return new ChatResponse(List.of());
+			// convert flux buffer to tool use message
+			List<ConverseStreamOutput> events = responses.stream()
+				.map(ChatResponse::getResult)
+				.filter(Objects::nonNull)
+				.map(Generation::getMetadata)
+				.filter(Objects::nonNull)
+				.map(metadata -> (BedrockConverseChatGenerationMetadata) metadata)
+				.map(metadata -> metadata.getEvent())
+				.toList();
+
+			Optional<ToolUseBlockStart> toolUseOptional = events.stream()
+				.filter(event -> event instanceof ContentBlockStartEvent)
+				.map(event -> (ContentBlockStartEvent) event)
+				.map(event -> event.start().toolUse())
+				.findFirst();
+
+			if (toolUseOptional.isEmpty()) {
+				throw new IllegalStateException("Bedrock streaming tools metadata is missing.");
+			}
+
+			ToolUseBlockStart toolUseBlockStart = toolUseOptional.get();
+
+			String functionArguments = events.stream()
+				.filter(event -> event instanceof ContentBlockDeltaEvent)
+				.map(event -> (ContentBlockDeltaEvent) event)
+				.filter(event -> event.delta().toolUse() != null)
+				.map(event -> event.delta().toolUse().input())
+				.collect(Collectors.joining());
+
+			Message message = Message.builder()
+				.content(ContentBlock.builder()
+					.toolUse(ToolUseBlock.builder()
+						.name(toolUseBlockStart.name())
+						.toolUseId(toolUseBlockStart.toolUseId())
+						.input(BedrockConverseApiUtils.convertObjectToDocument(ModelOptionsUtils.jsonToMap(functionArguments)))
+						.build())
+					.build())
+				.role(ConversationRole.ASSISTANT)
+				.build();
+
+			ChatResponse chatResponse = responses.get(0);
+
+			var metadata = (BedrockConverseChatGenerationMetadata) chatResponse.getResult().getMetadata();
+
+			metadata.setMessage(message);
+			metadata.setFinishReason(StopReason.TOOL_USE.toString());
+
+			List<ToolUseBlock> list = message.content()
+				.stream()
+				.filter(content -> content.type() == Type.TOOL_USE)
+				.map(content -> content.toolUse())
+				.toList();
+			System.out.println(list);
+
+			System.out.println("zzz:" + metadata.getMessage());
+			return chatResponse;
 		}
 	}
 
@@ -282,7 +351,22 @@ public class BedrockAnthropic3ChatModel
 			return false;
 		}
 
-		return StopReason.fromValue(result.getMetadata().getFinishReason()) == StopReason.TOOL_USE;
+		var metadata = (BedrockConverseChatGenerationMetadata) result.getMetadata();
+		if (metadata == null) {
+			return false;
+		}
+		
+		if (metadata.getMessage() == null) {
+			return false;
+		}
+		
+		List<ToolUseBlock> toolToUseList = metadata.getMessage().content()
+				.stream()
+				.filter(content -> content.type() == Type.TOOL_USE)
+				.map(content -> content.toolUse())
+				.toList();
+
+		return StopReason.fromValue(metadata.getFinishReason()) == StopReason.TOOL_USE && toolToUseList.size() >0;
 	}
 
 	/**
